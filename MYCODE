@@ -1,0 +1,507 @@
+#include "Wire.h" // Include only necessary library for I2C communication
+#include "MPU6050_6Axis_MotionApps20.h" // Include MPU6050 library
+#include <SoftwareSerial.h>
+#include <Servo.h>
+// Renk sensörü için RX ve TX pinlerini tanımlayın
+#define COLOR_SENSOR_RX_PIN 15
+#define COLOR_SENSOR_TX_PIN 14
+
+SoftwareSerial colorSensorSerial(COLOR_SENSOR_RX_PIN, COLOR_SENSOR_TX_PIN);
+
+
+
+// Define ESC objects for each motor
+Servo esc1, esc2, esc3, esc4, esc5, esc6;
+
+// Button and LED pins
+const int buttonPin = 12;   // Button pin number
+const int ledPin = 11;  
+const int leak = 31; //duzel 8e tak
+
+float yawInDegrees ;
+
+
+int EN = 31;              // EN(ENABLE) pini
+int STEP = 33;            // STEP(ADIM) pini
+int DIR = 35;             // DIR(YÖN) pini
+
+
+
+
+// Variables for button state and system control
+int buttonState = 1;       // Current button state
+int lastButtonState = 0;   // Previous button state
+bool systemOn = true ;     // System state (ON/OFF)
+
+MPU6050 mpu;
+
+#define INTERRUPT_PIN 2 // Use pin 2 on Arduino Uno & most boards
+#define LED_PIN 13 // (Arduino is 13)
+
+bool dmpReady = false;  // Set true if DMP init was successful
+uint8_t devStatus;      // Return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // Expected DMP packet size (default is 42 bytes)
+uint8_t fifoBuffer[64]; // FIFO storage buffer
+
+Quaternion q;           // [w, x, y, z] Quaternion container
+VectorFloat gravity;    // [x, y, z] Gravity vector
+float ypr[3];           // [yaw, pitch, roll] Container for Euler angles
+
+void setup() {
+    Wire.begin(); // Initialize I2C communication
+    Wire.setClock(400000); // 400kHz I2C clock
+
+    Serial.begin(115200);
+  esc1.attach(2, 1000, 2000);
+  esc2.attach(3, 1000, 2000);
+  esc3.attach(4, 1000, 2000);
+  esc4.attach(5, 1000, 2000);
+  esc5.attach(6, 1000, 2000);
+  esc6.attach(7, 1000, 2000);
+
+ 
+    
+  pinMode(EN, OUTPUT);   // EN pinini çıkış olarak ayarlıyoruz
+  pinMode(DIR, OUTPUT);  // DIR pinini çıkış olarak ayarlıyoruz
+  pinMode(STEP, OUTPUT); // STEP pinini çıkış olarak ayarlıyoruz
+  digitalWrite(EN, LOW); // EN pinini LOW yapıyoruz ki modül çalışmaya başlasın
+  // Set button pin as input and LED pin as output
+  pinMode(buttonPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  pinMode(leak, INPUT);
+
+  // Calibration process for all ESCs
+  calibrateESCs();
+    while (!Serial); // Wait for Serial port to be ready
+
+    // Initialize MPU6050
+    mpu.initialize();
+    pinMode(INTERRUPT_PIN, INPUT);
+
+    // Verify connection
+    if (mpu.testConnection()) {
+        Serial.println(F("MPU6050 connection successful"));
+
+        // Load and configure the DMP
+        devStatus = mpu.dmpInitialize();
+
+        if (devStatus == 0) {
+            // Set offsets for gyro and accelerometer
+            mpu.setXGyroOffset(220);
+            mpu.setYGyroOffset(76);
+            mpu.setZGyroOffset(-85);
+            mpu.setZAccelOffset(1788);
+
+            // Calibration and enable DMP
+            mpu.CalibrateAccel(6);
+            mpu.CalibrateGyro(6);
+            mpu.PrintActiveOffsets();
+            mpu.setDMPEnabled(true);
+
+            // Get expected DMP packet size
+            packetSize = mpu.dmpGetFIFOPacketSize();
+            dmpReady = true;
+            Serial.println(F("DMP ready!"));
+        } else {
+            Serial.print(F("DMP Initialization failed (code "));
+            Serial.print(devStatus);
+            Serial.println(F(")"));
+        }
+    } else {
+        Serial.println(F("MPU6050 connection failed"));
+    }
+
+    // Configure LED for output
+    pinMode(LED_PIN, OUTPUT);
+}
+
+void loop() {
+ 
+  if(digitalRead(leak)==LOW)
+  {
+
+
+      buttonState = digitalRead(buttonPin);
+
+    // Check if the button is pressed (state change detection)
+    if (buttonState == HIGH && lastButtonState == LOW) {
+      systemOn = !systemOn;  // Toggle the system state
+      if (systemOn) {
+        Serial.println("System ON");
+          // Turn the LED on
+      } else {
+        Serial.println("System OFF");
+        digitalWrite(ledPin, LOW);   // Turn the LED off
+        stopAll();  // Stop all ESCs when the system is turned OFF
+      }
+    }
+
+    lastButtonState = buttonState;  // Update the previous button state
+
+
+      if (!dmpReady) return;
+
+      // Read a packet from FIFO
+      if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+          // Get quaternion and gravity vector
+          mpu.dmpGetQuaternion(&q, fifoBuffer);
+          mpu.dmpGetGravity(&gravity, &q);
+
+          // Get Euler angles (yaw, pitch, roll)
+          mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+          // Adjust yaw to be in the range [0, 360) degrees
+          float yawInDegrees = ypr[0] * 180/M_PI;
+          float newyaw; 
+          if (yawInDegrees < 0) {
+              yawInDegrees += 360.0;
+          }
+
+          // Display Euler angles in degrees
+          Serial.print("ypr\t");
+          Serial.print(yawInDegrees); // Yaw in [0, 360) range
+          Serial.print("\t");
+          Serial.print(ypr[1] * 180/M_PI); // Pitch
+          Serial.print("\t");
+          Serial.println(ypr[2] * 180/M_PI); // Roll
+
+    balanceRoll();  // Add this line to balance roll at the very beginning
+    digitalWrite(ledPin, systemOn ? HIGH : LOW);    
+    // Check if data is available on the serial port when the system is ON
+    if (systemOn && Serial.available() > 0) {
+      // Read the incoming byte
+      
+      int command = Serial.parseInt();
+      
+      
+      // Execute the corresponding function based on the received number
+      switch (command) {
+        case 1:
+          moveForward();
+          break;
+        case 2:
+          moveBackward();
+          break;
+        case 3:
+          turnLeft(yawInDegrees);
+          break;
+        case 4:
+          turnRight(yawInDegrees);
+          break;
+        case 5:
+          moveUp();
+          break;
+        case 6:
+          moveDown();
+          break;
+        case 7:
+          strafeLeft();
+          break;
+        case 8:
+          strafeRight();
+          break;
+        case 0:
+          stopAll();
+          break;
+        case 10:
+          rotate360(yawInDegrees);
+          break;  
+        case 44:
+          shoot();
+          break;  
+         case 72:
+          sabitdur();
+          break;   
+        default:
+          // Unknown command, do nothing
+          break;
+      }
+    }
+
+    delay(50);  // Debounce delay
+
+
+
+  }
+  }
+  else
+  {
+    moveUp();
+    stopAll();
+    systemOn = false;
+
+  }
+  }
+
+
+
+void calibrateESCs() {
+  // Send calibration signals to all ESCs
+  esc1.write(180);
+  esc2.write(180);
+  esc3.write(180);
+  esc4.write(180);
+  esc5.write(180);
+  esc6.write(180);
+  delay(2000);
+  
+  esc1.write(0);
+  esc2.write(0);
+  esc3.write(0);
+  esc4.write(0);
+  esc5.write(0);
+  esc6.write(0);
+  delay(2000);
+  
+  esc1.write(90);
+  esc2.write(90);
+  esc3.write(90);
+  esc4.write(90);
+  esc5.write(90);
+  esc6.write(90);
+  delay(2000);
+}
+
+void moveForward() {
+  Serial.println("forward");
+  esc1.write(120);
+  esc2.write(120);
+  esc3.write(90);
+  esc4.write(90);
+  esc5.write(120);
+  esc6.write(120);
+
+}
+
+void moveBackward() {
+  Serial.println("back");
+  esc1.write(60);
+  esc2.write(60);
+  esc3.write(90);
+  esc4.write(90);
+  esc5.write(60);
+  esc6.write(60);
+}
+
+void turnLeft(float yawd) {
+  Serial.println("left");
+    float targetYaw = yawd - 90;
+    if (targetYaw < 0) {
+        targetYaw += 360;
+    }
+
+    // Turn left until the current yaw reaches the target yaw
+    while (true) {
+        // Read a packet from FIFO to update yaw value
+        if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+            yawInDegrees = ypr[0] * 180 / M_PI;
+            if (yawInDegrees < 0) {
+                yawInDegrees += 360.0;
+            }
+
+            // Check if the target yaw is reached
+            if (yawInDegrees >= targetYaw - 1 && yawInDegrees <= targetYaw + 1) {
+                break; // Exit the loop if target yaw is reached
+            }
+        }
+
+        // Adjust motor speeds to turn left
+        esc1.write(60);
+        esc2.write(120);
+        esc3.write(90);
+        esc4.write(90);
+        esc5.write(60);
+        esc6.write(120);
+
+        delay(10); // Short delay to allow yaw update
+    }
+
+    // Stop the motors after turning
+    stopAll();
+}
+
+
+
+
+
+  void rotate360(float yawInDegrees) {
+
+    Serial.println("right");
+    float targetYaw = yawInDegrees + 355;
+    if (targetYaw > 360) {
+        targetYaw -= 360;
+    }
+
+    // Turn right until the current yaw reaches the target yaw
+    while (true) {
+        // Read a packet from FIFO to update yaw value
+        if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+            yawInDegrees = ypr[0] * 180 / M_PI;
+            if (yawInDegrees < 0) {
+                yawInDegrees += 360.0;
+            }
+
+            // Check if the target yaw is reached
+            if (yawInDegrees >= targetYaw - 1 && yawInDegrees <= targetYaw + 1) {
+                break; // Exit the loop if target yaw is reached
+            }
+        }
+
+        // Adjust motor speeds to turn right
+        esc1.write(120);
+        esc2.write(60);
+        esc3.write(90);
+        esc4.write(90);
+        esc5.write(120);
+        esc6.write(60);
+
+        delay(10); // Short delay to allow yaw update
+    }
+
+    // Stop the motors after turning
+    stopAll();
+}
+
+
+
+void moveUp() {
+  Serial.println("up");
+  esc1.write(90);
+  esc2.write(90);
+  esc3.write(120);
+  esc4.write(120);
+  esc5.write(90);
+  esc6.write(90);
+}
+
+
+
+void moveDown() {
+  Serial.println("down");
+  esc1.write(90);
+  esc2.write(90);
+  esc3.write(60);
+  esc4.write(60);
+  esc5.write(90);
+  esc6.write(90);
+}
+void turnRight(float yawInDegrees) {
+
+    Serial.println("right");
+    float targetYaw = yawInDegrees + 90;
+    if (targetYaw > 360) {
+        targetYaw -= 360;
+    }
+
+    // Turn right until the current yaw reaches the target yaw
+    while (true) {
+        // Read a packet from FIFO to update yaw value
+        if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+            yawInDegrees = ypr[0] * 180 / M_PI;
+            if (yawInDegrees < 0) {
+                yawInDegrees += 360.0;
+            }
+
+            // Check if the target yaw is reached
+            if (yawInDegrees >= targetYaw - 1 && yawInDegrees <= targetYaw + 1) {
+                break; // Exit the loop if target yaw is reached
+            }
+        }
+
+        // Adjust motor speeds to turn right
+        esc1.write(120);
+        esc2.write(60);
+        esc3.write(90);
+        esc4.write(90);
+        esc5.write(120);
+        esc6.write(60);
+
+        delay(10); // Short delay to allow yaw update
+    }
+
+    // Stop the motors after turning
+    stopAll();
+} 
+
+
+void stopAll() {
+  Serial.println("stop");
+  esc1.write(90);
+  esc2.write(90);
+  esc3.write(90);
+  esc4.write(90);
+  esc5.write(90);
+  esc6.write(90);
+}
+
+void sabitdur() {
+  Serial.println("sabitdur");
+  esc1.write(90);
+  esc2.write(90);
+  esc3.write(100);
+  esc4.write(100);
+  esc5.write(90);
+  esc6.write(90);
+}
+
+void strafeLeft() {
+  Serial.println("strafe left");
+  esc1.write(60);
+  esc2.write(120);
+  esc3.write(90);
+  esc4.write(90);
+  esc5.write(120);
+  esc6.write(60);
+}
+
+void strafeRight() {
+  Serial.println("strafe right");
+
+  esc1.write(120);
+  esc2.write(60);
+  esc3.write(90);
+  esc4.write(90);
+  esc5.write(60);
+  esc6.write(120);
+}
+
+
+void shoot()
+{
+  digitalWrite(DIR, LOW);        // Motor yönünü ileri olarak ayarlıyoruz
+  for(int x = 0; x < 1800; x++){ // Motorumuzu 1000 adım ileri döndürüyoruz
+    digitalWrite(STEP, HIGH);
+    delayMicroseconds(390);      // Gecikme süresini kısaltarak hızı artırıyoruz
+    digitalWrite(STEP, LOW);
+    delayMicroseconds(390);      // Gecikme süresini kısaltarak hızı artırıyoruz
+  }
+  delay(500);                    // Yön değişimi öncesinde biraz bekleyelim
+  digitalWrite(DIR, HIGH);       // Motor yönünü geri olarak ayarlıyoruz
+  for(int x = 0; x < 1800; x++){ // Motorumuzu 1000 adım geri döndürüyoruz
+    digitalWrite(STEP, HIGH);
+    delayMicroseconds(700);      // Gecikme süresini kısaltarak hızı artırıyoruz
+    digitalWrite(STEP, LOW);
+    delayMicroseconds(700);      // Gecikme süresini kısaltarak hızı artırıyoruz
+    Serial.println("shoot");
+  }
+  delay(500);                    // Yön değişimi öncesinde biraz bekleyelim
+
+
+}
+
+
+
+
+
